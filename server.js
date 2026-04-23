@@ -107,9 +107,9 @@ app.post('/api/gemini-tts', async (req, res) => {
             },
         };
 
-        // 3. توليد الصوت
+        // 3. توليد الصوت بالنموذج الأحدث
         const response = await ai.models.generateContent({
-            model: 'gemini-1.5-flash-tts-preview', 
+            model: 'gemini-3.1-flash-tts-preview', // تم التحديث هنا بنجاح
             config: config,
             contents: [{ role: 'user', parts: [{ text: text }] }]
         });
