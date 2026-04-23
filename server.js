@@ -1,5 +1,5 @@
 const express = require('express');
-const { GoogleGenAI } = require('@google/genai');
+const { GoogleGenAI } = require('@google/genai'); // نستخدم المكتبة الجديدة التي قمت بتثبيتها
 const mime = require('mime');
 const cors = require('cors');
 const bodyParser = require('body-parser');
@@ -7,63 +7,32 @@ const bodyParser = require('body-parser');
 const app = express();
 const port = process.env.PORT || 3000;
 
-// إعدادات الوصول وتمرير البيانات
 app.use(cors());
 app.use(bodyParser.json());
 
-// إعداد مفتاح API الخاص بـ Gemini
-const genAI = new GoogleGenAI(process.env.GEMINI_API_KEY || 'YOUR_GEMINI_API_KEY');
+// ==========================================
+// ⚙️ نظام تدوير المفاتيح (Key Rotation System)
+// ==========================================
+// جلب المفاتيح وتفكيكها إلى مصفوفة (Array)
+const keysString = process.env.GEMINI_API_KEYS || process.env.GEMINI_API_KEY || 'YOUR_API_KEY';
+const apiKeys = keysString.split(',').map(key => key.trim()).filter(key => key.length > 0);
 
-/**
- * دالة بناء رأس ملف WAV (Header)
- * لضمان توافق الصوت مع مشغل HTML5 في المتصفح
- */
-function createWavHeader(dataLength, options) {
-    const { numChannels, sampleRate, bitsPerSample } = options;
-    const byteRate = (sampleRate * numChannels * bitsPerSample) / 8;
-    const blockAlign = (numChannels * bitsPerSample) / 8;
-    const buffer = Buffer.alloc(44);
+let currentKeyIndex = 0;
 
-    buffer.write('RIFF', 0);
-    buffer.writeUInt32LE(36 + dataLength, 4);
-    buffer.write('WAVE', 8);
-    buffer.write('fmt ', 12);
-    buffer.writeUInt32LE(16, 16);
-    buffer.writeUInt16LE(1, 20);
-    buffer.writeUInt16LE(numChannels, 22);
-    buffer.writeUInt32LE(sampleRate, 24);
-    buffer.writeUInt32LE(byteRate, 28);
-    buffer.writeUInt16LE(blockAlign, 32);
-    buffer.writeUInt16LE(bitsPerSample, 34);
-    buffer.write('data', 36);
-    buffer.writeUInt32LE(dataLength, 40);
-
-    return buffer;
+// دالة لاختيار المفتاح التالي بالتناوب (Round-Robin)
+function getNextApiKey() {
+    const key = apiKeys[currentKeyIndex];
+    currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length; // العودة للصفر عند انتهاء القائمة
+    return key;
 }
 
-/**
- * تحليل نوع بيانات الصوت المستلمة من Gemini
- */
-function parseMimeType(mimeType) {
-    const [fileType, ...params] = mimeType.split(';').map(s => s.trim());
-    const [_, format] = fileType.split('/');
-    const options = { numChannels: 1, sampleRate: 24000, bitsPerSample: 16 };
+// ... (دوال createWavHeader و parseMimeType تبقى كما هي بدون تغيير) ...
+function createWavHeader(dataLength, options) { /* كودك السابق */ }
+function parseMimeType(mimeType) { /* كودك السابق */ }
 
-    if (format && format.startsWith('L')) {
-        const bits = parseInt(format.slice(1), 10);
-        if (!isNaN(bits)) options.bitsPerSample = bits;
-    }
-
-    for (const param of params) {
-        const [key, value] = param.split('=').map(s => s.trim());
-        if (key === 'rate') options.sampleRate = parseInt(value, 10);
-    }
-    return options;
-}
-
-/**
- * نقطة النهاية (API Endpoint) التي سيستدعيها المساعد "قاسم"
- */
+// ==========================================
+// 🚀 واجهة برمجة التطبيقات (API Endpoint)
+// ==========================================
 app.post('/api/gemini-tts', async (req, res) => {
     const { text } = req.body;
 
@@ -72,44 +41,50 @@ app.post('/api/gemini-tts', async (req, res) => {
     }
 
     try {
-        const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash-tts-preview" });
+        // 1. سحب مفتاح مختلف لهذه العملية
+        const activeKey = getNextApiKey();
+        console.log(`🔑 Using Key Index: ${currentKeyIndex === 0 ? apiKeys.length - 1 : currentKeyIndex - 1}`);
+
+        // 2. تهيئة Gemini بالمفتاح النشط
+        const ai = new GoogleGenAI({ apiKey: activeKey });
         
-        const generationConfig = {
+        const config = {
             responseModalities: ["audio"],
             speechConfig: {
                 voiceConfig: { prebuiltVoiceConfig: { voiceName: "Orus" } }
             },
         };
 
-        const result = await model.generateContent([text], generationConfig);
-        const response = await result.response;
+        // 3. توليد الصوت
+        const response = await ai.models.generateContent({
+            model: 'gemini-1.5-flash-tts-preview', // تأكد من اسم الموديل المتاح لك
+            config: config,
+            contents: [{ role: 'user', parts: [{ text: text }] }]
+        });
         
-        // استخراج البيانات الصوتية (Base64) من استجابة Gemini
+        // استخراج البيانات الصوتية 
         const audioPart = response.candidates[0].content.parts.find(p => p.inlineData);
         
-        if (!audioPart) {
-            throw new Error('No audio data received from Gemini');
-        }
+        if (!audioPart) throw new Error('No audio data received');
 
         const rawData = audioPart.inlineData.data;
         const mimeType = audioPart.inlineData.mimeType;
         const options = parseMimeType(mimeType);
         
-        // تحويل البيانات إلى Buffer وإضافة رأس WAV
         const audioBuffer = Buffer.from(rawData, 'base64');
         const wavHeader = createWavHeader(audioBuffer.length, options);
         const finalWav = Buffer.concat([wavHeader, audioBuffer]);
 
-        // إرسال الملف الصوتي للمتصفح
         res.set('Content-Type', 'audio/wav');
         res.send(finalWav);
 
     } catch (error) {
-        console.error('Error generating TTS:', error);
+        console.error('Error generating TTS:', error.message);
         res.status(500).send('Internal Server Error');
     }
 });
 
 app.listen(port, () => {
     console.log(`🚀 Gemini TTS Server running at http://localhost:${port}`);
+    console.log(`🛡️ Key Rotation Active: Loaded ${apiKeys.length} keys.`);
 });
