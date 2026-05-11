@@ -67,12 +67,11 @@ app.post('/api/gemini-tts', async (req, res) => {
     if (!text) return res.status(400).send('Text is required');
 
     let attempts = 0;
-    const maxAttempts = Math.min(apiKeys.length, 5); // سيحاول مع 5 مفاتيح بحد أقصى
+    const maxAttempts = Math.min(apiKeys.length, 5);
 
     while (attempts < maxAttempts) {
         const activeKey = getNextApiKey();
         try {
-            // استخدام نفس الطريقة التي نجحت معك
             const ai = new GoogleGenAI({ apiKey: activeKey });
             
             const config = {
@@ -97,18 +96,18 @@ app.post('/api/gemini-tts', async (req, res) => {
 
             console.log(`✅ النجاح للـ TTS باستخدام المفتاح رقم: ${currentKeyIndex}`);
             res.set('Content-Type', 'audio/wav');
-            return res.send(finalWav); // إنهاء الطلب بنجاح
+            return res.send(finalWav); 
 
         } catch (error) {
             attempts++;
             console.error(`⚠️ محاولة ${attempts} للـ TTS فشلت: ${error.message}. جاري تجربة مفتاح آخر...`);
-            // انتظار بسيط لتهدئة الضغط
             await new Promise(resolve => setTimeout(resolve, 200));
         }
     }
 
-    // إذا فشلت كل المحاولات
-    res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط مع خدمة الصوت' });
+    if (!res.headersSent) {
+        return res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط مع خدمة الصوت' });
+    }
 });
 
 // ==========================================
@@ -123,24 +122,48 @@ app.post('/api/correct-bac-subject', async (req, res) => {
 
     let attempts = 0;
     const maxAttempts = Math.min(apiKeys.length, 5) || 1;
+    const MAX_FILE_SIZE = 12 * 1024 * 1024; // حماية الذاكرة: الحد الأقصى 12 ميغابايت
 
     try {
         const topicLabel = topicNumber === 1 ? "الموضوع الأول" : "الموضوع الثاني";
         let base64Pdf = null;
         
-        // استخراج الـ ID
         const match = driveUrl.match(/\/(?:d|file\/d)\/([a-zA-Z0-9_-]+)/) || driveUrl.match(/open\?id=([a-zA-Z0-9_-]+)/);
         const fileId = match ? match[1] : null;
 
         if (fileId) {
             const directExportUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
-            // جلب الـ PDF عبر الخادم لتخطي قيود الـ CORS
-            const pdfResponse = await fetch(directExportUrl);
-            if (pdfResponse.ok) {
-                const arrayBuffer = await pdfResponse.arrayBuffer();
-                base64Pdf = Buffer.from(arrayBuffer).toString('base64');
-            } else {
-                console.warn("Failed to fetch PDF in backend:", pdfResponse.status);
+            
+            // تطبيق نظام الـ AbortSignal لتجنب تعليق الاتصال (Timeout Protection)
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 15000); // 15 ثانية كحد أقصى للتحميل
+
+            try {
+                const pdfResponse = await fetch(directExportUrl, { signal: controller.signal });
+                clearTimeout(timeoutId);
+
+                if (pdfResponse.ok) {
+                    // التحقق من حجم الملف عبر ترويسة Content-Length إن وجدت
+                    const contentLength = pdfResponse.headers.get('content-length');
+                    if (contentLength && parseInt(contentLength) > MAX_FILE_SIZE) {
+                        return res.status(413).json({ error: "حجم ملف الامتحان يتجاوز الحد المسموح به للتحليل الفوري (12MB)." });
+                    }
+
+                    const arrayBuffer = await pdfResponse.arrayBuffer();
+                    
+                    // تحقق إضافي من الحجم الفعلي للـ Buffer المحمل
+                    if (arrayBuffer.byteLength > MAX_FILE_SIZE) {
+                        return res.status(413).json({ error: "حجم ملف الامتحان يتجاوز الحد المسموح به للتحليل الفوري (12MB)." });
+                    }
+
+                    base64Pdf = Buffer.from(arrayBuffer).toString('base64');
+                } else {
+                    console.warn("Failed to fetch PDF in backend:", pdfResponse.status);
+                }
+            } catch (fetchError) {
+                clearTimeout(timeoutId);
+                console.error("Drive fetch aborted or failed:", fetchError.message);
+                return res.status(504).json({ error: "انتهت مهلة الاتصال بخوادم Google Drive. يرجى المحاولة لاحقاً." });
             }
         }
 
@@ -172,7 +195,7 @@ ${solutionUrl ? 'رابط التصحيح الوزاري المرجعي: ' + solu
                     model: 'gemini-1.5-flash',
                     config: {
                         systemInstruction: sysInst,
-                        temperature: 0.2 // لضمان صرامة بيداغوجية
+                        temperature: 0.2
                     },
                     contents: [{
                         role: 'user', 
@@ -191,17 +214,19 @@ ${solutionUrl ? 'رابط التصحيح الوزاري المرجعي: ' + solu
             } catch (apiError) {
                 attempts++;
                 console.error(`⚠️ محاولة ${attempts} للتصحيح فشلت: ${apiError.message}. جاري تجربة مفتاح آخر...`);
-                // انتظار بسيط لتهدئة الضغط
                 await new Promise(resolve => setTimeout(resolve, 200));
             }
         }
 
-        // إذا فشلت كل المحاولات
-        return res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط مع Gemini' });
+        if (!res.headersSent) {
+            return res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط مع Gemini' });
+        }
 
     } catch (error) {
         console.error('Error in /api/correct-bac-subject:', error);
-        res.status(500).json({ error: 'Internal Server Error: ' + error.message });
+        if (!res.headersSent) {
+            return res.status(500).json({ error: 'Internal Server Error: ' + error.message });
+        }
     }
 });
 
