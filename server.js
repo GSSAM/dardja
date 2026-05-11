@@ -7,7 +7,8 @@ const app = express();
 const port = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(bodyParser.json({ limit: '20mb' }));
+// زيادة حد الاستقبال إلى 25 ميغابايت لتجنب رفض الطلبات ذات البيانات الكبيرة
+app.use(bodyParser.json({ limit: '25mb' }));
 
 // =========================================================================
 // ⚙️ نظام تدوير المفاتيح (Key Rotation System)
@@ -27,15 +28,15 @@ apiKeys = [...new Set(apiKeys)];
 let currentKeyIndex = 0;
 
 function getNextApiKey() {
-    if (apiKeys.length === 0) throw new Error("No API Keys found!");
+    if (apiKeys.length === 0) throw new Error("No API Keys found in environment variables!");
     const key = apiKeys[currentKeyIndex];
     currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length; 
     return key;
 }
 
-// ==========================================
+// =========================================================================
 // 🛠️ معالجة ملف الـ WAV
-// ==========================================
+// =========================================================================
 function createWavHeader(dataLength) {
     const sampleRate = 24000;
     const channels = 1;
@@ -43,6 +44,7 @@ function createWavHeader(dataLength) {
     const byteRate = (sampleRate * channels * bitDepth) / 8;
     const blockAlign = (channels * bitDepth) / 8;
     const buffer = Buffer.alloc(44);
+    
     buffer.write('RIFF', 0);
     buffer.writeUInt32LE(36 + dataLength, 4);
     buffer.write('WAVE', 8);
@@ -56,18 +58,20 @@ function createWavHeader(dataLength) {
     buffer.writeUInt16LE(bitDepth, 34);
     buffer.write('data', 36);
     buffer.writeUInt32LE(dataLength, 40);
+    
     return buffer;
 }
 
 // =========================================================================
-// 🚀 المحرك الذكي للـ TTS (نموذج المعاينة الأحدث)
+// 🚀 المحرك الذكي للـ TTS (نص إلى كلام)
 // =========================================================================
 app.post('/api/gemini-tts', async (req, res) => {
     const { text } = req.body;
     if (!text) return res.status(400).send('Text is required');
 
     let attempts = 0;
-    const maxAttempts = Math.min(apiKeys.length, 5);
+    const maxAttempts = Math.min(apiKeys.length, 5) || 1;
+    let lastError = "";
 
     while (attempts < maxAttempts) {
         const activeKey = getNextApiKey();
@@ -83,7 +87,7 @@ app.post('/api/gemini-tts', async (req, res) => {
             });
             
             const audioPart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
-            if (!audioPart) throw new Error('No audio received');
+            if (!audioPart) throw new Error('No audio received from model');
 
             const audioBuffer = Buffer.from(audioPart.inlineData.data, 'base64');
             const wavHeader = createWavHeader(audioBuffer.length);
@@ -93,15 +97,19 @@ app.post('/api/gemini-tts', async (req, res) => {
             return res.send(finalWav); 
         } catch (error) {
             attempts++;
-            console.error(`⚠️ TTS Failure (Attempt ${attempts}): ${error.message}`);
-            await new Promise(r => setTimeout(r, 250));
+            lastError = error.message;
+            console.error(`⚠️ محاولة ${attempts} للـ TTS فشلت: ${lastError}`);
+            await new Promise(resolve => setTimeout(resolve, 250));
         }
     }
-    if (!res.headersSent) res.status(500).json({ error: 'TTS Service Failed' });
+
+    if (!res.headersSent) {
+        return res.status(500).json({ error: 'All keys failed', details: lastError });
+    }
 });
 
 // =========================================================================
-// 🎓 محرك التصحيح المطور (استخدام Gemini Flash Latest)
+// 📝 خدمة استخراج الأسئلة والتصحيح (Gemini Flash Latest Edition)
 // =========================================================================
 app.post('/api/correct-bac-subject', async (req, res) => {
     const { driveUrl, subject, branchName, year, topicNumber, solutionUrl } = req.body;
@@ -110,56 +118,79 @@ app.post('/api/correct-bac-subject', async (req, res) => {
 
     let attempts = 0;
     const maxAttempts = Math.min(apiKeys.length, 5) || 1;
-    const MAX_FILE_SIZE = 15 * 1024 * 1024; // 15MB
+    const MAX_FILE_SIZE = 15 * 1024 * 1024; // 15 ميغابايت
 
     try {
-        const topicLabel = (topicNumber == 1) ? "الموضوع الأول" : "الموضوع الثاني";
+        const isTopicOne = (topicNumber === 1 || topicNumber === '1');
+        const topicLabel = isTopicOne ? "الموضوع الأول" : "الموضوع الثاني";
         let base64Pdf = null;
         
         const match = driveUrl.match(/\/(?:d|file\/d)\/([a-zA-Z0-9_-]+)/) || driveUrl.match(/open\?id=([a-zA-Z0-9_-]+)/);
         const fileId = match ? match[1] : null;
 
         if (fileId) {
-            const directUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`;
+            const directExportUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`;
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 35000); // مهلة 35 ثانية
+            const timeoutId = setTimeout(() => controller.abort(), 35000); // 35 ثانية لتخطي البدء البارد
 
             try {
-                const pdfResponse = await fetch(directUrl, { signal: controller.signal });
+                const pdfResponse = await fetch(directExportUrl, { signal: controller.signal });
                 clearTimeout(timeoutId);
 
                 if (pdfResponse.ok) {
+                    const contentType = pdfResponse.headers.get('content-type');
+                    if (contentType && contentType.includes('text/html')) {
+                        return res.status(502).json({ error: "فشل استخراج الـ PDF: خوادم Google Drive أعادت صفحة ويب بدلاً من الملف." });
+                    }
+
                     const arrayBuffer = await pdfResponse.arrayBuffer();
                     if (arrayBuffer.byteLength > MAX_FILE_SIZE) {
-                        return res.status(413).json({ error: "الملف كبير جداً (أقصى حد 15MB)" });
+                        return res.status(413).json({ error: "حجم ملف الامتحان يتجاوز الحد المسموح به للتحليل الفوري (15MB)." });
                     }
+
                     base64Pdf = Buffer.from(arrayBuffer).toString('base64');
                 } else {
-                    return res.status(502).json({ error: "فشل سحب الملف من Google Drive" });
+                    return res.status(502).json({ error: `Google Drive رفض الاتصال (الرمز: ${pdfResponse.status}).` });
                 }
-            } catch (e) {
+            } catch (fetchError) {
                 clearTimeout(timeoutId);
-                return res.status(504).json({ error: "انتهت مهلة جلب الملف" });
+                return res.status(504).json({ error: "انتهت مهلة الاتصال بخوادم Google Drive." });
             }
         }
 
-        if (!base64Pdf) return res.status(500).json({ error: "تعذر معالجة ملف PDF" });
+        if (!base64Pdf) return res.status(500).json({ error: "تعذر استخراج ملف PDF من الرابط المقدم." });
 
-        const promptText = `أريدك أن تقدم تصحيحاً مفصلاً ونموذجياً لموضوع البكالوريا المرفق (PDF).
-المادة: ${subject}, الشعبة: ${branchName}, السنة: ${year}.
-📌 المطلوب: حل أسئلة **${topicLabel}** فقط بدقة متناهية وشرح بيداغوجي مفصل. 
-استخدم LaTeX للرياضيات ($x^2$ و $$f(x)$$). التزم بأسلوب الأستاذ قاسم الصارم والدقيق.`;
+        // 🎯 الـ Prompt الهندسي المزدوج (استخراج الأسئلة + الحل)
+        const promptText = `أريدك أن تتصرف كـ "الأستاذ قاسم"، وتقدم خدمة بيداغوجية متكاملة لموضوع البكالوريا المرفق (PDF).
+المادة: ${subject || 'غير محدد'}
+الشعبة: ${branchName || 'غير محدد'}
+السنة: ${year || 'غير محدد'}
+${solutionUrl ? 'رابط التصحيح الوزاري للاستئناس: ' + solutionUrl : ''}
 
-        const sysInst = "أنت 'الأستاذ قاسم'، خبير تصحيح البكالوريا الجزائرية. قدم تصحيحات نموذجية تشرح المنهجية.";
-        let lastError = "";
+📌 [المهام المطلوبة بصرامة لـ "${topicLabel}" فقط]:
+1. **استخراج نص الأسئلة:** اقرأ ملف الـ PDF المرفق، واستخرج نص التمارين والأسئلة الخاصة بـ "${topicLabel}" فقط واكتبها بشكل منظم وموضح.
+2. **تقديم الحل المفصل:** تحت نص الأسئلة، قدم حلاً نموذجياً مفصلاً يشرح المنهجية وكيفية الانتقال المنطقي والرياضي بين الخطوات لضمان العلامة الكاملة.
+3. **التنسيق المطلوب لمخرجاتك:** يجب أن تعيد إجابتك بصيغة **JSON نقي** يحتوي على حقلين نصيين فقط:
+   - الحقل الأول باسم "questionsText": يحتوي على نص الأسئلة المستخرج كاملاً ومنسقاً.
+   - الحقل الثاني باسم "correction": يحتوي على الشرح والحل النموذجي المفصل.
+   
+   استخدم تنسيق LaTeX للرياضيات ($x^2$ للمضمنة و $$f(x)$$ للمستقلة) داخل النصوص. لا تضف أي نص أو علامات Markdown خارج كائن الـ JSON.`;
+
+        const sysInst = "أنت 'الأستاذ قاسم'، خبير تصحيح البكالوريا الجزائرية. أعد إجابتك دائماً بتنسيق JSON صارم ونظيف.";
+        let lastApiError = "";
 
         while (attempts < maxAttempts) {
             const activeKey = getNextApiKey();
             try {
                 const ai = new GoogleGenAI({ apiKey: activeKey });
+                
                 const response = await ai.models.generateContent({
-                    model: 'gemini-flash-latest', // 🚀 التحديث هنا: استخدام أحدث نسخة فلاش دائماً
-                    config: { systemInstruction: sysInst, temperature: 0.2 },
+                    model: 'gemini-flash-latest', 
+                    config: {
+                        systemInstruction: sysInst,
+                        temperature: 0.1,
+                        responseMimeType: "application/json" 
+                    },
                     contents: [{
                         role: 'user', 
                         parts: [
@@ -169,22 +200,40 @@ app.post('/api/correct-bac-subject', async (req, res) => {
                     }]
                 });
                 
-                if (!response.text) throw new Error('Empty response');
-                console.log(`✅ [Correction Success] تم الحل باستخدام gemini-flash-latest`);
-                return res.json({ correction: response.text });
+                const responseText = response.candidates[0].content.parts[0].text;
+                if (!responseText) throw new Error('توليد نصي فارغ');
 
-            } catch (err) {
+                const parsedResult = JSON.parse(responseText);
+                if (!parsedResult.questionsText || !parsedResult.correction) {
+                    throw new Error("النموذج لم يرجع الحقول المطلوبة (questionsText, correction)");
+                }
+
+                console.log(`✅ [Correction Success] تم الحل والتخزين باستخدام gemini-flash-latest`);
+                return res.json({ 
+                    questionsText: parsedResult.questionsText,
+                    correction: parsedResult.correction 
+                });
+
+            } catch (apiError) {
                 attempts++;
-                lastError = err.message;
-                await new Promise(r => setTimeout(r, 300));
+                lastApiError = apiError.message;
+                console.error(`⚠️ محاولة #${attempts} للتصحيح المستهدف فشلت: ${lastApiError}`);
+                await new Promise(resolve => setTimeout(resolve, 300));
             }
         }
 
-        if (!res.headersSent) res.status(500).json({ error: 'All keys failed', details: lastError });
+        if (!res.headersSent) {
+            return res.status(500).json({ error: 'تعذر استخراج الحل من الذكاء الاصطناعي.', details: lastApiError });
+        }
 
     } catch (error) {
-        if (!res.headersSent) res.status(500).json({ error: error.message });
+        console.error('Critical Error in /api/correct-bac-subject:', error);
+        if (!res.headersSent) {
+            return res.status(500).json({ error: 'خطأ داخلي: ' + error.message });
+        }
     }
 });
 
-app.listen(port, () => console.log(`🚀 Server running on port ${port} | Keys: ${apiKeys.length}`));
+app.listen(port, () => {
+    console.log(`🚀 BACFLIX Cloud AI Server Running on port ${port} | Keys: ${apiKeys.length}`);
+});
