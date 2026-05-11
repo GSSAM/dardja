@@ -60,7 +60,7 @@ function createWavHeader(dataLength) {
 }
 
 // ==========================================
-// 🚀 المحرك الذكي (مُعدل ليناسب طريقتك)
+// 🚀 المحرك الذكي للـ TTS (نص إلى كلام)
 // ==========================================
 app.post('/api/gemini-tts', async (req, res) => {
     const { text } = req.body;
@@ -95,22 +95,116 @@ app.post('/api/gemini-tts', async (req, res) => {
             const wavHeader = createWavHeader(audioBuffer.length);
             const finalWav = Buffer.concat([wavHeader, audioBuffer]);
 
-            console.log(`✅ النجاح باستخدام المفتاح رقم: ${currentKeyIndex}`);
+            console.log(`✅ النجاح للـ TTS باستخدام المفتاح رقم: ${currentKeyIndex}`);
             res.set('Content-Type', 'audio/wav');
             return res.send(finalWav); // إنهاء الطلب بنجاح
 
         } catch (error) {
             attempts++;
-            console.error(`⚠️ محاولة ${attempts} فشلت: ${error.message}. جاري تجربة مفتاح آخر...`);
+            console.error(`⚠️ محاولة ${attempts} للـ TTS فشلت: ${error.message}. جاري تجربة مفتاح آخر...`);
             // انتظار بسيط لتهدئة الضغط
             await new Promise(resolve => setTimeout(resolve, 200));
         }
     }
 
     // إذا فشلت كل المحاولات
-    res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط' });
+    res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط مع خدمة الصوت' });
+});
+
+// ==========================================
+// 📝 المحرك الذكي للتصحيح المباشر (Multimodal PDF)
+// ==========================================
+app.post('/api/correct-bac-subject', async (req, res) => {
+    const { driveUrl, subject, branchName, year, topicNumber, solutionUrl } = req.body;
+
+    if (!driveUrl) {
+        return res.status(400).json({ error: 'driveUrl is required' });
+    }
+
+    let attempts = 0;
+    const maxAttempts = Math.min(apiKeys.length, 5) || 1;
+
+    try {
+        const topicLabel = topicNumber === 1 ? "الموضوع الأول" : "الموضوع الثاني";
+        let base64Pdf = null;
+        
+        // استخراج الـ ID
+        const match = driveUrl.match(/\/(?:d|file\/d)\/([a-zA-Z0-9_-]+)/) || driveUrl.match(/open\?id=([a-zA-Z0-9_-]+)/);
+        const fileId = match ? match[1] : null;
+
+        if (fileId) {
+            const directExportUrl = `https://drive.google.com/uc?export=download&id=${fileId}`;
+            // جلب الـ PDF عبر الخادم لتخطي قيود الـ CORS
+            const pdfResponse = await fetch(directExportUrl);
+            if (pdfResponse.ok) {
+                const arrayBuffer = await pdfResponse.arrayBuffer();
+                base64Pdf = Buffer.from(arrayBuffer).toString('base64');
+            } else {
+                console.warn("Failed to fetch PDF in backend:", pdfResponse.status);
+            }
+        }
+
+        if (!base64Pdf) {
+            return res.status(500).json({ error: "تعذر استخراج ملف PDF من رابط جوجل درايف عبر الخادم. تأكد من أن الرابط عام وصالح." });
+        }
+
+        const promptText = `أريدك أن تقدم تصحيحاً مفصلاً ونموذجياً لموضوع البكالوريا التالي:
+المادة: ${subject}
+الشعبة: ${branchName}
+السنة: ${year}
+${solutionUrl ? 'رابط التصحيح الوزاري المرجعي: ' + solutionUrl : ''}
+
+📌 [توجيه حاسم]: لقد قمت بإرفاق ملف الـ PDF الفعلي لورقة الأسئلة الرسمية ضمن هذا الطلب. اقرأ محتوى الملف المرفق بدقة متناهية، وتجاهل الموضوع الآخر تماماً وركز 100% على استخراج وحل أسئلة "${topicLabel}" فقط لتجنب أي هلوسة.
+
+[تعليمات المنهجية الصارمة]:
+1. اشرح الحل خطوة بخطوة. وضح للمترشح أين تذهب النقاط، وكيف ينتقل من خطوة لأخرى رياضياً أو منطقياً.
+2. استخدم رموز LaTeX للمعادلات الرياضية، مثلاً: $x^2$ للمعادلات المدمجة، و $$x^2$$ للمعادلات المستقلة.
+3. اتبع أسلوب "الأستاذ قاسم" في الشرح: كن دقيقاً، صارماً في المنهجية، ومشجعاً في نفس الوقت.`;
+
+        const sysInst = "أنت 'الأستاذ قاسم'، أستاذ جزائري مخضرم في تصحيح البكالوريا. قدم تصحيحات نموذجية مفصلة تشرح منهجية الإجابة بأسلوب أكاديمي دقيق.";
+
+        while (attempts < maxAttempts) {
+            const activeKey = getNextApiKey();
+            try {
+                const ai = new GoogleGenAI({ apiKey: activeKey });
+                
+                const response = await ai.models.generateContent({
+                    model: 'gemini-1.5-flash',
+                    config: {
+                        systemInstruction: sysInst,
+                        temperature: 0.2 // لضمان صرامة بيداغوجية
+                    },
+                    contents: [{
+                        role: 'user', 
+                        parts: [
+                            { inlineData: { mimeType: "application/pdf", data: base64Pdf } },
+                            { text: promptText }
+                        ]
+                    }]
+                });
+                
+                if (!response.text) throw new Error('No text received');
+
+                console.log(`✅ النجاح في التصحيح باستخدام المفتاح رقم: ${currentKeyIndex}`);
+                return res.json({ correction: response.text });
+
+            } catch (apiError) {
+                attempts++;
+                console.error(`⚠️ محاولة ${attempts} للتصحيح فشلت: ${apiError.message}. جاري تجربة مفتاح آخر...`);
+                // انتظار بسيط لتهدئة الضغط
+                await new Promise(resolve => setTimeout(resolve, 200));
+            }
+        }
+
+        // إذا فشلت كل المحاولات
+        return res.status(500).json({ error: 'All keys failed', details: 'استنفدت جميع محاولات الربط مع Gemini' });
+
+    } catch (error) {
+        console.error('Error in /api/correct-bac-subject:', error);
+        res.status(500).json({ error: 'Internal Server Error: ' + error.message });
+    }
 });
 
 app.listen(port, () => {
-    console.log(`🚀 BACFLIX TTS Server Running | Loaded ${apiKeys.length} keys.`);
+    console.log(`🚀 BACFLIX TTS & Correction Server Running | Loaded ${apiKeys.length} keys.`);
 });
