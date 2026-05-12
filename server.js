@@ -1,5 +1,5 @@
 const express = require('express');
-const { GoogleGenAI } = require('@google/genai'); 
+const { GoogleGenAI } = require('@google/genai');
 const cors = require('cors');
 const bodyParser = require('body-parser');
 
@@ -30,7 +30,7 @@ let currentKeyIndex = 0;
 function getNextApiKey() {
     if (apiKeys.length === 0) throw new Error("No API Keys found in environment variables!");
     const key = apiKeys[currentKeyIndex];
-    currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length; 
+    currentKeyIndex = (currentKeyIndex + 1) % apiKeys.length;
     return key;
 }
 
@@ -44,7 +44,7 @@ function createWavHeader(dataLength) {
     const byteRate = (sampleRate * channels * bitDepth) / 8;
     const blockAlign = (channels * bitDepth) / 8;
     const buffer = Buffer.alloc(44);
-    
+
     buffer.write('RIFF', 0);
     buffer.writeUInt32LE(36 + dataLength, 4);
     buffer.write('WAVE', 8);
@@ -58,7 +58,7 @@ function createWavHeader(dataLength) {
     buffer.writeUInt16LE(bitDepth, 34);
     buffer.write('data', 36);
     buffer.writeUInt32LE(dataLength, 40);
-    
+
     return buffer;
 }
 
@@ -81,11 +81,11 @@ app.post('/api/gemini-tts', async (req, res) => {
                 model: 'gemini-3.1-flash-tts-preview',
                 config: {
                     responseModalities: ["audio"],
-                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: "Orus" } } }
+                    speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: req.body.voice || "Orus" } } }
                 },
                 contents: [{ role: 'user', parts: [{ text: text }] }]
             });
-            
+
             const audioPart = response.candidates?.[0]?.content?.parts?.find(p => p.inlineData);
             if (!audioPart) throw new Error('No audio received from model');
 
@@ -94,7 +94,7 @@ app.post('/api/gemini-tts', async (req, res) => {
             const finalWav = Buffer.concat([wavHeader, audioBuffer]);
 
             res.set('Content-Type', 'audio/wav');
-            return res.send(finalWav); 
+            return res.send(finalWav);
         } catch (error) {
             attempts++;
             lastError = error.message;
@@ -123,83 +123,91 @@ app.post('/api/correct-bac-subject', async (req, res) => {
     try {
         const isTopicOne = (topicNumber === 1 || topicNumber === '1');
         const topicLabel = isTopicOne ? "الموضوع الأول" : "الموضوع الثاني";
-        let base64Pdf = null;
-        
-        const match = driveUrl.match(/\/(?:d|file\/d)\/([a-zA-Z0-9_-]+)/) || driveUrl.match(/open\?id=([a-zA-Z0-9_-]+)/);
-        const fileId = match ? match[1] : null;
 
-        if (fileId) {
+        // --- وظيفة مساعدة لتحميل الملفات من قوقل درايف ---
+        async function downloadFromDrive(url) {
+            const match = url.match(/\/(?:d|file\/d)\/([a-zA-Z0-9_-]+)/) || url.match(/open\?id=([a-zA-Z0-9_-]+)/);
+            const fileId = match ? match[1] : null;
+            if (!fileId) return null;
+
             const directExportUrl = `https://drive.google.com/uc?export=download&id=${fileId}&confirm=t`;
             const controller = new AbortController();
-            const timeoutId = setTimeout(() => controller.abort(), 35000); // 35 ثانية لتخطي البدء البارد
+            const timeoutId = setTimeout(() => controller.abort(), 35000);
 
             try {
                 const pdfResponse = await fetch(directExportUrl, { signal: controller.signal });
                 clearTimeout(timeoutId);
-
                 if (pdfResponse.ok) {
-                    const contentType = pdfResponse.headers.get('content-type');
-                    if (contentType && contentType.includes('text/html')) {
-                        return res.status(502).json({ error: "فشل استخراج الـ PDF: خوادم Google Drive أعادت صفحة ويب بدلاً من الملف." });
-                    }
-
                     const arrayBuffer = await pdfResponse.arrayBuffer();
-                    if (arrayBuffer.byteLength > MAX_FILE_SIZE) {
-                        return res.status(413).json({ error: "حجم ملف الامتحان يتجاوز الحد المسموح به للتحليل الفوري (15MB)." });
-                    }
-
-                    base64Pdf = Buffer.from(arrayBuffer).toString('base64');
-                } else {
-                    return res.status(502).json({ error: `Google Drive رفض الاتصال (الرمز: ${pdfResponse.status}).` });
+                    if (arrayBuffer.byteLength > MAX_FILE_SIZE) return null;
+                    return Buffer.from(arrayBuffer).toString('base64');
                 }
-            } catch (fetchError) {
+                return null;
+            } catch (e) {
                 clearTimeout(timeoutId);
-                return res.status(504).json({ error: "انتهت مهلة الاتصال بخوادم Google Drive." });
+                return null;
             }
         }
 
-        if (!base64Pdf) return res.status(500).json({ error: "تعذر استخراج ملف PDF من الرابط المقدم." });
+        // 1. تحميل ملف الموضوع (إلزامي)
+        const base64Subject = await downloadFromDrive(driveUrl);
+        if (!base64Subject) return res.status(500).json({ error: "تعذر استخراج ملف الموضوع من الرابط المقدم." });
+
+        // 2. تحميل ملف الحل الوزاري (اختياري)
+        let base64Solution = null;
+        if (solutionUrl) {
+            base64Solution = await downloadFromDrive(solutionUrl);
+            if (base64Solution) console.log("🔍 [Multi-File Mode]: تم العثور على حل وزاري وسيتم دمجه في التحليل.");
+        }
 
         // 🎯 الـ Prompt الهندسي المزدوج (استخراج الأسئلة + الحل)
-        const promptText = `أريدك أن تتصرف كـ "الأستاذ قاسم"، وتقدم خدمة بيداغوجية متكاملة لموضوع البكالوريا المرفق (PDF).
+        const promptText = `أنت "الأستاذ قاسم"، خبير تصحيح البكالوريا الجزائرية.
+مهمتك: توليد حل مفصل وبيداغوجي لـ "${topicLabel}" من ملف الموضوع المرفق.
+
+${base64Solution ? "⚠️ هام جداً: لقد أرفقت لك أيضاً 'ملف الحل الوزاري الرسمي'. يجب أن تلتزم بمنهجية الحل وسلم التنقيط والنتائج النهائية الموجودة فيه حرفياً، ولكن قم بشرح الخطوات بأسلوبك البيداغوجي المفصل." : "ملاحظة: اعتمد على خبرتك في حل هذا الموضوع بدقة."}
+
 المادة: ${subject || 'غير محدد'}
 الشعبة: ${branchName || 'غير محدد'}
 السنة: ${year || 'غير محدد'}
-${solutionUrl ? 'رابط التصحيح الوزاري للاستئناس: ' + solutionUrl : ''}
 
-📌 [المهام المطلوبة بصرامة لـ "${topicLabel}" فقط]:
-1. **استخراج نص الأسئلة:** اقرأ ملف الـ PDF المرفق، واستخرج نص التمارين والأسئلة الخاصة بـ "${topicLabel}" فقط واكتبها بشكل منظم وموضح.
-2. **تقديم الحل المفصل:** تحت نص الأسئلة، قدم حلاً نموذجياً مفصلاً يشرح المنهجية وكيفية الانتقال المنطقي والرياضي بين الخطوات لضمان العلامة الكاملة.
-3. **التنسيق المطلوب لمخرجاتك:** يجب أن تعيد إجابتك بصيغة **JSON نقي** يحتوي على حقلين نصيين فقط:
-   - الحقل الأول باسم "questionsText": يحتوي على نص الأسئلة المستخرج كاملاً ومنسقاً.
-   - الحقل الثاني باسم "correction": يحتوي على الشرح والحل النموذجي المفصل.
+📌 [المهام المطلوبة]:
+1. **استخراج نص الأسئلة:** استخرج نص التمارين والأسئلة الخاصة بـ "${topicLabel}" فقط.
+2. **تقديم الحل المفصل:** قدم حلاً نموذجياً مفصلاً يشرح المنهجية لضمان العلامة الكاملة.
+3. **التنسيق:** أعد إجابتك بصيغة JSON تحتوي على:
+   - "questionsText": نص الأسئلة منسقاً.
+   - "correction": الحل المشروح بالتفصيل.
    
-   استخدم تنسيق LaTeX للرياضيات ($x^2$ للمضمنة و $$f(x)$$ للمستقلة) داخل النصوص. لا تضف أي نص أو علامات Markdown خارج كائن الـ JSON.`;
+استخدم LaTeX للرياضيات ($x^2$ و $$f(x)$$).`;
 
-        const sysInst = "أنت 'الأستاذ قاسم'، خبير تصحيح البكالوريا الجزائرية. أعد إجابتك دائماً بتنسيق JSON صارم ونظيف.";
+        const sysInst = "أنت 'الأستاذ قاسم'، خبير تصحيح البكالوريا الجزائرية. أعد إجابتك دائماً بتنسيق JSON صارم ونظيف يحتوي على questionsText و correction.";
         let lastApiError = "";
 
         while (attempts < maxAttempts) {
             const activeKey = getNextApiKey();
             try {
                 const ai = new GoogleGenAI({ apiKey: activeKey });
-                
+
+                // إعداد أجزاء الرسالة (الموضوع + الحل إذا وجد + النص)
+                const messageParts = [
+                    { inlineData: { mimeType: "application/pdf", data: base64Subject } }
+                ];
+
+                if (base64Solution) {
+                    messageParts.push({ inlineData: { mimeType: "application/pdf", data: base64Solution } });
+                }
+
+                messageParts.push({ text: promptText });
+
                 const response = await ai.models.generateContent({
-                    model: 'gemini-flash-latest', 
+                    model: 'gemini-flash-latest',
                     config: {
                         systemInstruction: sysInst,
                         temperature: 0.1,
-                        responseMimeType: "application/json" 
+                        responseMimeType: "application/json"
                     },
-                    contents: [{
-                        role: 'user', 
-                        parts: [
-                            { inlineData: { mimeType: "application/pdf", data: base64Pdf } },
-                            { text: promptText }
-                        ]
-                    }]
+                    contents: [{ role: 'user', parts: messageParts }]
                 });
-                
+
                 const responseText = response.candidates[0].content.parts[0].text;
                 if (!responseText) throw new Error('توليد نصي فارغ');
 
@@ -208,12 +216,11 @@ ${solutionUrl ? 'رابط التصحيح الوزاري للاستئناس: ' + 
                     throw new Error("النموذج لم يرجع الحقول المطلوبة (questionsText, correction)");
                 }
 
-                console.log(`✅ [Correction Success] تم الحل والتخزين باستخدام gemini-flash-latest`);
-                return res.json({ 
+                console.log(`✅ [Correction Success] تم الحل بنجاح باستخدام المصدر المزدوج: ${base64Solution ? 'نعم' : 'لا'}`);
+                return res.json({
                     questionsText: parsedResult.questionsText,
-                    correction: parsedResult.correction 
+                    correction: parsedResult.correction
                 });
-
             } catch (apiError) {
                 attempts++;
                 lastApiError = apiError.message;
